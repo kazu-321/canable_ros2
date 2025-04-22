@@ -13,7 +13,7 @@ target_include_directories(${PROJECT_NAME}
 )
 
 rclcpp_components_register_node(${PROJECT_NAME}
-    PLUGIN "canable::canable"
+    PLUGIN "canable::canable_node"
     EXECUTABLE canable_node
 )
 

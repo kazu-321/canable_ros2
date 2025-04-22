@@ -1,76 +1,80 @@
 #include "canable/canable_node.hpp"
 
 namespace canable {
-    canable_node::canable_node(const rclcpp::NodeOptions & options)
-        : Node("canable_node", options),
-          canable_fd_(-1),
-          canable_device_port_("/dev/ttyACM0")
-    {
-        this->declare_parameter<std::string>("canable_device_port", canable_device_port_);
-        this->get_parameter("canable_device_port", canable_device_port_);
 
-        canable_fd_ = open(canable_device_port_.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);
-        if (canable_fd_ == -1) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to open CANABLE device: %s", canable_device_port_.c_str());
-            return;
-        }
+canable_node::canable_node(const rclcpp::NodeOptions &node_options)
+    : Node("canable_node", node_options) {
+    init_can_socket();
 
-        canable_pub_ = this->create_publisher<canable_msgs::msg::Can>("/can/receive", 10);
-        canable_sub_ = this->create_subscription<canable_msgs::msg::Can>(
-            "/can/transmit", 10, std::bind(&canable_node::can_topic_callback, this, std::placeholders::_1));
+    canable_pub_ = this->create_publisher<canable_msgs::msg::Can>("/can/receive", 10);
+    canable_sub_ = this->create_subscription<canable_msgs::msg::Can>(
+        "/can/transmit", 10,
+        [this](const canable_msgs::msg::Can::SharedPtr msg) {
+            this->write_can_socket(*msg);
+        });
 
-        canable_recive_thread_ = std::thread(&canable_node::canable_recive_loop, this);
+    // Start CAN read loop
+    std::thread([this]() { this->read_can_socket(); }).detach();
+}
+
+canable_node::~canable_node() {
+    if (can_socket_ >= 0) {
+        close(can_socket_);
+    }
+}
+
+void canable_node::init_can_socket() {
+    can_socket_ = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    if (can_socket_ < 0) {
+        RCLCPP_ERROR(this->get_logger(), "Failed to create CAN socket");
+        return;
     }
 
-    canable_node::~canable_node() {
-        if (canable_fd_ != -1) {
-            close(canable_fd_);
-        }
-        if (canable_recive_thread_.joinable()) {
-            canable_recive_thread_.join();
-        }
+    std::strcpy(ifr_.ifr_name, "can0"); // Use CAN interface "can0"
+    if (ioctl(can_socket_, SIOCGIFINDEX, &ifr_) < 0) {
+        RCLCPP_ERROR(this->get_logger(), "Failed to get interface index");
+        return;
     }
 
-    void canable_node::can_topic_callback(const canable_msgs::msg::Can::SharedPtr msg) {
-        if (canable_fd_ == -1) {
-            RCLCPP_ERROR(this->get_logger(), "CANABLE device not open");
-            return;
-        }
-
-        // Send the CAN message to the CANABLE device (SLCAN)
-        std::ostringstream ss;
-        ss << 't' << std::hex << std::uppercase << std::setw(3) << std::setfill('0') << msg->id;
-        ss << msg->dlc;
-        for(size_t i = 0; i < msg->dlc; ++i) {
-            ss << std::hex << std::uppercase << std::setw(2) << std::setfill('0') << static_cast<int>(msg->data[i] & 0xFF);
-        }
-        ss << '\r';
-        std::string command = ss.str();
-        write(canable_fd_, command.c_str(), command.size());
-        RCLCPP_INFO(this->get_logger(), "Sent CAN message: %s", command.c_str());
+    addr_.can_family = AF_CAN;
+    addr_.can_ifindex = ifr_.ifr_ifindex;
+    if (bind(can_socket_, (struct sockaddr *)&addr_, sizeof(addr_)) < 0) {
+        RCLCPP_ERROR(this->get_logger(), "Failed to bind CAN socket");
+        return;
     }
+    
+    RCLCPP_INFO(this->get_logger(), "CAN socket initialized and bound to %s", ifr_.ifr_name);
+}
 
-    void canable_node::canable_recive_loop() {
-        if (canable_fd_ == -1) {
-            RCLCPP_ERROR(this->get_logger(), "CANABLE device not open");
-            return;
-        }
-
-        char buffer[256];
-        while (rclcpp::ok()) {
-            int bytes_read = read(canable_fd_, buffer, sizeof(buffer) - 1);
-            if (bytes_read > 0) {
-                buffer[bytes_read] = '\0';
-                std::string response(buffer);
-                if (response[0] == 'r') {
-                    canable_msgs::msg::Can msg;
-                    msg.id = std::stoul(response.substr(1, 3), nullptr, 16);
-                    msg.dlc = response[4] - '0';
-                    for (size_t i = 0; i < msg.dlc; ++i) {
-                        msg.data[i] = std::stoul(response.substr(5 + i * 2, 2), nullptr, 16);
-                    }
-                    canable_pub_->publish(msg);
-                }
-            }
+void canable_node::read_can_socket() {
+    struct can_frame frame;
+    while (rclcpp::ok()) {
+        int nbytes = read(can_socket_, &frame, sizeof(struct can_frame));
+        if (nbytes > 0) {
+            auto msg = canable_msgs::msg::Can();
+            msg.id = frame.can_id;
+            msg.dlc = frame.can_dlc;
+            std::copy(std::begin(frame.data), std::begin(frame.data) + frame.can_dlc, msg.data.begin());
+            canable_pub_->publish(msg);
         }
     }
+}
+
+void canable_node::write_can_socket(const canable_msgs::msg::Can &msg) {
+    struct can_frame frame;
+    std::memset(&frame, 0, sizeof(struct can_frame));
+    frame.can_id = msg.id;
+    frame.can_dlc = msg.dlc;
+    std::copy(msg.data.begin(), msg.data.begin() + msg.dlc, frame.data);
+
+    if (write(can_socket_, &frame, sizeof(struct can_frame)) < 0) {
+        RCLCPP_ERROR(this->get_logger(), "Failed to send CAN message");
+    } else {
+        RCLCPP_INFO(this->get_logger(), "Sent CAN message with ID: %X", msg.id);
+    }
+}
+
+} // namespace canable
+
+#include "rclcpp_components/register_node_macro.hpp"
+RCLCPP_COMPONENTS_REGISTER_NODE(canable::canable_node)
