@@ -69,8 +69,6 @@ void canable_node::write_can_socket(const canable_msgs::msg::Can &msg) {
 
     if (write(can_socket_, &frame, sizeof(struct can_frame)) < 0) {
         RCLCPP_ERROR(this->get_logger(), "Failed to send CAN message");
-    } else {
-        RCLCPP_INFO(this->get_logger(), "Sent CAN message with ID: %X", msg.id);
     }
 }
 
