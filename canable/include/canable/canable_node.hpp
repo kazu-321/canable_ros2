@@ -17,10 +17,13 @@ public:
     ~canable_node();
 
 private:
-    void init_can_socket(); // Initialize CAN socket
+    int init_can_socket(); // Initialize CAN socket
     void read_can_socket(); // Read messages from CAN socket
     void write_can_socket(const canable_msgs::msg::Can &frame); // Write messages to CAN socket
-
+    bool retry_open_can = true;
+    bool retry_write_can = true;
+    int retry_write_count = 0;
+    int max_retry_write_count = 5;
     int can_socket_;
     struct sockaddr_can addr_;
     struct ifreq ifr_;
